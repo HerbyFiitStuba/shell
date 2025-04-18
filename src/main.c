@@ -1,5 +1,6 @@
 #include "config.h"
 #include "logger.h"
+#include "server.h"
 #include <stdio.h>
 
 int main(int argc, char **argv) {
@@ -16,6 +17,12 @@ int main(int argc, char **argv) {
     log_debug("Verbose mode enabled");
 
     // TODO: bude nasledovat server_run() alebo client_run()
+    
+    if (cfg.mode == 0) {
+        server_run(&cfg);
+    } else {
+        // client_run(&cfg); // neskôr
+    }
 
     log_close();
     return 0;
