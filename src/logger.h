@@ -7,6 +7,7 @@
 int  log_init(char *path, int verbose);
 void log_info(char *fmt, ...);
 void log_error(char *fmt, ...);
+void log_perror(char *msg);
 void log_debug(char *fmt, ...);
 void log_close(void);
 #endif // LOGGER_H
