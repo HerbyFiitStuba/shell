@@ -12,10 +12,9 @@
 #include <fcntl.h>      // Added for fcntl (non-blocking)
 
 // Initial size and growth step for the dynamic buffer
-#define INITIAL_BUFFER_SIZE 128
-#define GROWTH_INCREMENT 128
-#define MAX_EVENTS 64       // Max events per epoll_wait call
-// #define MAX_CLIENTS 1024 // No longer needed
+static const size_t INITIAL_BUFFER_SIZE = 128; // Initial size of the buffer
+static const size_t GROWTH_INCREMENT = 128; // Growth step for the buffer
+static const size_t MAX_EVENTS = 64;       // Max events per epoll_wait call
 
 // Structure to hold state for each client
 typedef struct {
