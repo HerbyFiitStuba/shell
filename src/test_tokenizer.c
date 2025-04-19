@@ -40,10 +40,12 @@ int main() {
         "single'quote'word",               // Quotes within word (becomes one word)
         "word\"with\"quote",               // Quotes within word
         "echo 'unclosed single quote",     // Error: Unclosed single quote
-        "echo \"unclosed double quote",     // Error: Unclosed double quote
+        "echo \"unclosed double quote",    // Error: Unclosed double quote
         "|",                               // Operator only
         "< > ; |",                         // Multiple operators
-        "<>;|",                         // Multiple operators
+        "<>;|",                            // Multiple operators
+        ";",                               // Semicolon only
+        ";;",                              // Multiple semicolons
         NULL                               // Sentinel to mark the end
     };
 
@@ -53,5 +55,6 @@ int main() {
     }
 
     printf("Tokenizer Tests Finished.\n");
+
     return 0;
 }
