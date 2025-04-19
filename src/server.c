@@ -1,5 +1,6 @@
 #include "server.h"
 #include "logger.h"
+#include "prompt.h" // <-- Add include for prompt generation
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -225,6 +226,23 @@ static void handle_client_read(int fd, int epoll_fd) {
 
         // Advance line_start past the processed line (including the newline)
         line_start = newline_pos + 1;
+
+        // --- Send prompt after processing command ---
+        const char *prompt = generate_prompt();
+        ssize_t prompt_len = strlen(prompt);
+        if (write(fd, prompt, prompt_len) < 0) {
+             if (errno != EPIPE && errno != EAGAIN && errno != EWOULDBLOCK) {
+                log_perror("write prompt failed");
+             } else if (errno == EPIPE) {
+                 log_info("Client fd %d disconnected (Broken Pipe on prompt write)", fd);
+                 remove_client(fd, epoll_fd);
+                 return; // Client gone
+             }
+             // If EAGAIN/EWOULDBLOCK, prompt might not be sent immediately.
+             // A full implementation would buffer this output.
+        }
+        // --- End prompt sending ---
+
     }
 
     // Remove processed data from the buffer by shifting remaining data
@@ -396,6 +414,20 @@ void server_run(const Config *cfg) {
                         remove_client(client_fd, epoll_fd); // Clean up if add fails
                     } else {
                          log_debug("Added client fd %d to epoll", client_fd);
+                         // --- Send initial prompt ---
+                         const char *prompt = generate_prompt();
+                         ssize_t prompt_len = strlen(prompt);
+                         if (write(client_fd, prompt, prompt_len) < 0) {
+                             if (errno != EPIPE && errno != EAGAIN && errno != EWOULDBLOCK) {
+                                log_perror("initial prompt write failed");
+                                // Consider removing client if initial write fails badly?
+                             } else if (errno == EPIPE) {
+                                 log_info("Client fd %d disconnected immediately (Broken Pipe on initial prompt)", client_fd);
+                                 remove_client(client_fd, epoll_fd); // Clean up immediately
+                             }
+                             // If EAGAIN/EWOULDBLOCK, prompt might not be sent immediately.
+                         }
+                         // --- End initial prompt sending ---
                     }
                 }
             } else {
