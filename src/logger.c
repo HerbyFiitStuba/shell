@@ -54,7 +54,8 @@ int log_init(char *path, int verbose) {
             printf("INFO: Logging to file '%s'\n", path);
         }
     } else {
-        new_fd = STDERR_FILENO;
+        //new_fd = STDERR_FILENO;
+        new_fd = -1; // Set to -1 to indicate no file opened
     }
 
     // If a previous file was opened (and it wasn't stderr), close it first.
@@ -107,6 +108,12 @@ static void log_prefix(char *level) {
 
 // Generic log function using varargs
 static void log_generic(char *level, char *fmt, va_list ap) {
+    // Check if log_fd is valid
+    if (log_fd < 0) {
+        // If log_fd is invalid, return
+        return;
+    }
+
     char msg_buf[LOG_BUFFER_SIZE];
 
     log_prefix(level); // Write the prefix first
