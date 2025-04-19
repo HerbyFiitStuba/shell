@@ -1,6 +1,9 @@
 #include "server.h"
 #include "logger.h"
 #include "prompt.h" // <-- Add include for prompt generation
+#include "executor.h" // <-- Include for execute_command_sequence
+#include "parser.h" // <-- Include for tokenize, parse, free_tokens
+#include "tokenizer.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -11,11 +14,16 @@
 #include <stdlib.h>     // Needed for malloc, realloc, free
 #include <sys/epoll.h>  // Added for epoll
 #include <fcntl.h>      // Added for fcntl (non-blocking)
+#include <signal.h>     // Added for sig_atomic_t
+#include <stdio.h>      // For dprintf (writing help/errors to fd)
 
 // Initial size and growth step for the dynamic buffer
 static const size_t INITIAL_BUFFER_SIZE = 128; // Initial size of the buffer
 static const size_t GROWTH_INCREMENT = 128; // Growth step for the buffer
 static const size_t MAX_EVENTS = 64;       // Max events per epoll_wait call
+
+// --- Global flag to signal server halt ---
+static volatile sig_atomic_t halt_requested = 0;
 
 // Structure to hold state for each client
 typedef struct {
@@ -198,28 +206,64 @@ static void handle_client_read(int fd, int epoll_fd) {
     char *line_start = client->buffer;
     char *newline_pos;
     while ((newline_pos = memchr(line_start, '\n', client->buffer_size - (line_start - client->buffer))) != NULL) {
-        size_t line_len = newline_pos - line_start;
+        // size_t line_len = newline_pos - line_start;
 
         // Temporarily null-terminate the line for processing
         *newline_pos = '\0';
-
-        // --- TODO: Replace this echo with command parsing and execution ---
+        
+        // --- Replace echo with parsing and execution ---
         log_debug("Received line from fd %d: %s", fd, line_start);
-
-        // Echo back the line (including the newline we replaced)
-        // Note: This write might block or fail if the client buffer is full.
-        // A full non-blocking implementation would buffer output and use EPOLLOUT.
-        if (write(fd, line_start, line_len) < 0 || write(fd, "\n", 1) < 0) {
-             if (errno != EPIPE && errno != EAGAIN && errno != EWOULDBLOCK) { // Ignore broken pipe and temporary unavailability
-                log_perror("write to client failed");
-             } else if (errno == EPIPE) {
-                 log_info("Client fd %d disconnected (Broken Pipe on write)", fd);
-                 remove_client(fd, epoll_fd);
-                 return; // Client gone, stop processing buffer
-             }
-             // If EAGAIN/EWOULDBLOCK, we should ideally buffer the output and wait for EPOLLOUT
+        
+        // 1. Tokenize
+        Token *tokens = tokenize(line_start);
+        if (tokens == NULL) {
+            log_error("Tokenizer failed for input from fd %d", fd);
+            // Optionally send an error message back to the client
+            dprintf(fd, "Error: Tokenization failed.\n");
+            // Continue to next line or handle error further
+        } else {
+            // 2. Parse
+            Command *cmd_sequence = parse(tokens);
+            if (cmd_sequence == NULL) {
+                log_error("Parser failed for input from fd %d", fd);
+                // Parser already prints syntax errors to stderr
+                // Optionally send a generic error message back to the client
+                dprintf(fd, "Error: Command parsing failed (syntax error?).\n");
+            } else {
+                // 3. Execute
+                log_debug("Executing command sequence for fd %d", fd);
+                int exec_result = execute_command_sequence(cmd_sequence, fd);
+                log_debug("Execution finished for fd %d with result %d", fd, exec_result);
+        
+                // Handle execution results
+                if (exec_result == EXEC_QUIT) {
+                    log_info("Client fd %d requested quit.", fd);
+                    remove_client(fd, epoll_fd); // Close connection
+                    free_command_sequence(cmd_sequence); // Free parsed structure
+                    free_tokens(tokens);                 // Free tokens
+                    return; // Stop processing buffer for this client
+                } else if (exec_result == EXEC_HALT) {
+                    log_info("Halt command received from fd %d. Initiating server shutdown.", fd);
+                    // Need a way to signal the main loop in server_run to break
+                    // This might involve setting a global flag or using a pipe/signal
+                    // For now, just log it. A proper implementation needs server loop modification.
+                    // Example: Set a global flag `static volatile sig_atomic_t halt_requested = 0;`
+                    //          and check it in the server_run loop.
+                    halt_requested = 1; // Set the global flag to signal shutdown
+                    dprintf(fd, "Server halt initiated.\n"); // Inform client
+                    // The main loop will detect the flag and break
+                } else if (exec_result == EXEC_ERROR) {        
+                    log_error("Critical execution error for fd %d.", fd);
+                    // Error message should have been sent to client via stderr redirection
+                    // dprintf(fd, "Error: Command execution failed.\n"); // Optional generic message
+                }
+                // Free parsed structure if execution didn't cause immediate return
+                free_command_sequence(cmd_sequence);
+            }
+            // Free tokens if parsing didn't cause immediate return
+            free_tokens(tokens);
         }
-        // --- End TODO section ---
+        // --- End parsing and execution section ---
 
         // Restore newline if needed, though not strictly necessary as we advance past it
         // *newline_pos = '\n';
@@ -344,8 +388,17 @@ void server_run(const Config *cfg) {
     log_info("Starting epoll event loop...");
 
     // Main Event Loop
-    for (;;) {
+    // for (;;) { // Original loop
+    while (!halt_requested) { // Loop until halt is requested
         int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1); // Wait indefinitely
+
+        // Check halt flag *immediately* after epoll_wait returns,
+        // especially if wait could be interrupted by signals in the future.
+        if (halt_requested) {
+            log_info("Halt flag detected after epoll_wait, breaking loop.");
+            break;
+        }
+
         if (n == -1) {
             if (errno == EINTR) {
                 continue; // Interrupted by signal, safe to continue
