@@ -1,6 +1,7 @@
 #include "config.h"
 #include "logger.h"
 #include "server.h"
+#include "client.h"
 #include <stdio.h>
 
 int main(int argc, char **argv) {
@@ -21,7 +22,7 @@ int main(int argc, char **argv) {
     if (cfg.mode == 0) {
         server_run(&cfg);
     } else {
-        // client_run(&cfg); // neskôr
+        client_run(&cfg); 
     }
 
     log_close();

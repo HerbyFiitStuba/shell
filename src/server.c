@@ -307,12 +307,14 @@ int socket_setup(const Config *cfg) {
     struct sockaddr_in serv_addr;
     int opt = 1;
 
+    // *** Create socket ***
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         log_perror("socket() failed");
         return -1;
     }
 
+    // *** Set socket options ***
     if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         log_perror("setsockopt(SO_REUSEADDR) failed");
         close(listen_fd);
@@ -325,9 +327,10 @@ int socket_setup(const Config *cfg) {
         return -1;
     }
 
+    // *** Bind to address and port ***
     memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(cfg->port);
+    serv_addr.sin_family = AF_INET;  // IPv4
+    serv_addr.sin_port = htons(cfg->port);  // Port number in network byte order
     if (cfg->bind_addr[0] != '\0') {
         if (inet_pton(AF_INET, cfg->bind_addr, &serv_addr.sin_addr) <= 0) {
             log_error("inet_pton('%s') failed: %s", cfg->bind_addr, strerror(errno));
