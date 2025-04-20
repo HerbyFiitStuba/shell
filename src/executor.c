@@ -16,18 +16,18 @@
 #include <sys/socket.h> // For getsockname, getpeername
 #include <netinet/in.h> // For sockaddr_in
 #include <arpa/inet.h>  // For inet_ntop
+#include <limits.h>     // For INT_MAX with strtol
 
 #define WRITE_BUFFER_SIZE 1024 // Buffer for formatting output before write
 
 // --- Forward Declarations for Helper Functions ---
-// Updated signatures
 static int execute_pipeline(Command *pipeline_head, int client_fd, const Config *cfg, client_state **clients, int client_count);
 static int handle_builtin(Command *cmd, int client_fd, const Config *cfg, client_state **clients, int client_count);
 static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_out_fd, int (*all_pipe_fds)[2], int num_pipes, const Config *cfg, client_state **clients, int client_count); // Added server state params
-// Updated signatures for built-in functions
+
+// --- Helper Functions for Built-ins ---
 static int print_help(int output_fd);
 static int print_stat(int output_fd, const Config *cfg, client_state **clients, int client_count);
-// New helper
 static int write_all(int fd, const char *buf, size_t len);
 
 
@@ -97,10 +97,13 @@ static int write_all(int fd, const char *buf, size_t len) {
  */
 // Updated signature
 static int execute_pipeline(Command *pipeline_head, int client_fd, const Config *cfg, client_state **clients, int client_count) {
+    char err_msg[WRITE_BUFFER_SIZE]; // Buffer for error messages
+    int err_len; 
 
-    // --- Check the *first* command for terminating built-ins ---
+    // --- Check the *first* command for terminating or special built-ins ---
     int first_cmd_type = handle_builtin(pipeline_head, client_fd, cfg, clients, client_count);
 
+    // Handle terminating built-ins (quit, halt)
     if (first_cmd_type == EXEC_QUIT || first_cmd_type == EXEC_HALT) {
         if (pipeline_head->next_command_in_pipeline == NULL) {
             // Single command pipeline, execute terminating built-in directly
@@ -109,12 +112,51 @@ static int execute_pipeline(Command *pipeline_head, int client_fd, const Config 
         } else {
             // Terminating built-in cannot be in a pipeline
             log_error("Terminating built-in '%s' cannot be used in a pipeline.", pipeline_head->argv[0]);
-            char err_msg[100];
-            snprintf(err_msg, sizeof(err_msg), "Error: Built-in command '%s' cannot be used in a pipeline.\n", pipeline_head->argv[0]);
-            write_all(client_fd, err_msg, strlen(err_msg)); // Inform client
+            err_len = snprintf(err_msg, sizeof(err_msg), "Error: Built-in command '%s' cannot be used in a pipeline.\n", pipeline_head->argv[0]);
+            if (err_len > 0) write_all(client_fd, err_msg, err_len); // Inform client
             return EXEC_ERROR;
         }
     }
+
+    // Handle 'abort n' built-in
+    if (first_cmd_type == EXEC_ABORT_N) {
+        if (pipeline_head->next_command_in_pipeline == NULL) {
+            // 'abort' must be a single command
+            log_debug("Processing 'abort n' command from fd %d", client_fd);
+            // Validate arguments: must have exactly one argument (the index)
+            if (pipeline_head->argv[1] == NULL) {
+                log_error("Invalid 'abort' usage: requires exactly one argument (client index).");
+                err_len = snprintf(err_msg, sizeof(err_msg), "Error: Usage: abort <client_index>\n");
+                if (err_len > 0) write_all(client_fd, err_msg, err_len);
+                return EXEC_ERROR;
+            }
+
+            // Validate the argument is a non-negative integer within bounds
+            char *endptr;
+            long val;
+            errno = 0;
+            val = strtol(pipeline_head->argv[1], &endptr, 10);
+
+            if (errno != 0 || endptr == pipeline_head->argv[1] || *endptr != '\0' || val < 0 || val >= client_count || val > INT_MAX) {
+                 log_error("Invalid 'abort' index '%s': must be a valid integer between 0 and %d.", pipeline_head->argv[1], client_count - 1);
+                 err_len = snprintf(err_msg, sizeof(err_msg), "Error: Invalid client index '%s'. Must be between 0 and %d.\n", pipeline_head->argv[1], client_count - 1);
+                 if (err_len > 0) write_all(client_fd, err_msg, err_len);
+                 return EXEC_ERROR;
+            }
+
+            // Validation passed, signal server to perform the abort
+            log_debug("'abort %ld' validated, returning EXEC_ABORT_N.", val);
+            return EXEC_ABORT_N; // Server will handle the actual abort
+
+        } else {
+            // 'abort' cannot be in a pipeline
+            log_error("'abort' command cannot be used in a pipeline.");
+            err_len = snprintf(err_msg, sizeof(err_msg), "Error: Built-in command 'abort' cannot be used in a pipeline.\n");
+            if (err_len > 0) write_all(client_fd, err_msg, err_len); // Inform client
+            return EXEC_ERROR;
+        }
+    }
+
 
     // --- Proceed with pipeline execution for propagable built-ins or external commands ---
     // (first_cmd_type is EXEC_IS_PROPAGABLE or EXEC_NOT_BUILTIN)
@@ -125,7 +167,9 @@ static int execute_pipeline(Command *pipeline_head, int client_fd, const Config 
         // Basic check: ensure command exists
         if (!cmd_iter->argv || !cmd_iter->argv[0]) {
              log_error("Invalid command structure: empty command in pipeline.");
-             dprintf(client_fd, "Error: Invalid empty command in pipeline.\n");
+             // Use write_all for error message
+             err_len = snprintf(err_msg, sizeof(err_msg), "Error: Invalid empty command in pipeline.\n");
+             if (err_len > 0) write_all(client_fd, err_msg, err_len);
              return EXEC_ERROR; // Indicate an error in the structure
         }
         num_cmds++;
@@ -246,7 +290,7 @@ static int execute_pipeline(Command *pipeline_head, int client_fd, const Config 
  * @param cfg Server configuration (unused in this version).
  * @param clients Array of client states (unused in this version).
  * @param client_count Number of clients (unused in this version).
- * @return EXEC_QUIT, EXEC_HALT, EXEC_IS_PROPAGABLE, or EXEC_NOT_BUILTIN.
+ * @return EXEC_QUIT, EXEC_HALT, EXEC_ABORT_N, EXEC_IS_PROPAGable, or EXEC_NOT_BUILTIN.
  */
 // Updated signature and logic
 static int handle_builtin(Command *cmd, int client_fd, const Config *cfg, client_state **clients, int client_count) {
@@ -268,6 +312,8 @@ static int handle_builtin(Command *cmd, int client_fd, const Config *cfg, client
         return EXEC_QUIT;
     } else if (strcmp(command_name, "halt") == 0) {
         return EXEC_HALT;
+    } else if (strcmp(command_name, "abort") == 0) {
+        return EXEC_ABORT_N; // Identify abort, validation happens in execute_pipeline
     } else if (strcmp(command_name, "help") == 0) {
         return EXEC_IS_PROPAGABLE;
     } else if (strcmp(command_name, "stat") == 0) {
@@ -296,6 +342,8 @@ static int handle_builtin(Command *cmd, int client_fd, const Config *cfg, client
 // Added server state parameters
 static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_out_fd, int (*all_pipe_fds)[2], int num_pipes, const Config *cfg, client_state **clients, int client_count) {
     log_debug("Child (pid %d) setting up for command '%s'", getpid(), cmd->argv[0]);
+    char err_msg[WRITE_BUFFER_SIZE]; // Buffer for error messages
+    int err_len; // Renamed from n
 
     // --- Input Redirection ---
     if (cmd->input_file) {
@@ -303,7 +351,9 @@ static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_
         int fd_in = open(cmd->input_file, O_RDONLY);
         if (fd_in == -1) {
             log_perror("open input file failed");
-            dprintf(client_fd, "Error opening input file '%s': %s\n", cmd->input_file, strerror(errno));
+            // Use write_all for error message
+            err_len = snprintf(err_msg, sizeof(err_msg), "Error opening input file '%s': %s\n", cmd->input_file, strerror(errno));
+            if (err_len > 0) write_all(client_fd, err_msg, err_len); // Write to original client fd before redirection
             exit(EXIT_FAILURE);
         }
         if (dup2(fd_in, STDIN_FILENO) == -1) {
@@ -334,7 +384,10 @@ static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_
         if (fd_out == -1) {
             log_perror("open output file failed");
             // Error message will go to original stderr (client_fd or pipe)
-            dprintf(STDERR_FILENO, "Error opening output file '%s': %s\n", cmd->output_file, strerror(errno));
+            // Use write_all for error message
+            err_len = snprintf(err_msg, sizeof(err_msg), "Error opening output file '%s': %s\n", cmd->output_file, strerror(errno));
+             // Write to STDERR_FILENO which might be client_fd or a pipe write end
+            if (err_len > 0) write_all(STDERR_FILENO, err_msg, err_len);
             exit(EXIT_FAILURE);
         }
         if (dup2(fd_out, STDOUT_FILENO) == -1) {
@@ -415,12 +468,14 @@ static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_
 
         // --- execvp Failed ---
         log_perror("execvp failed");
-        dprintf(STDERR_FILENO, "Error executing command '%s': %s\n", cmd->argv[0], strerror(errno));
+        // Use write_all for error message
+        err_len = snprintf(err_msg, sizeof(err_msg), "Error executing command '%s': %s\n", cmd->argv[0], strerror(errno));
+        if (err_len > 0) write_all(STDERR_FILENO, err_msg, err_len); // Write to redirected STDERR
         exit(EXIT_FAILURE); // Terminate child on execvp failure
 
     } else {
-        // EXEC_QUIT or EXEC_HALT - should not happen in child if execute_pipeline is correct
-        log_error("Internal error: Terminating built-in '%s' reached child process.", cmd->argv[0]);
+        // EXEC_QUIT, EXEC_HALT, EXEC_ABORT_N - should not happen in child
+        log_error("Internal error: Non-propagable built-in '%s' reached child process.", cmd->argv[0]);
         exit(EXIT_FAILURE);
     }
 }
@@ -434,43 +489,43 @@ static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_
 // Updated signature and implementation
 static int print_stat(int output_fd, const Config *cfg, client_state **clients, int client_count) {
     char buffer[WRITE_BUFFER_SIZE];
-    int n;
+    int bytes_written; // Renamed from n
     int write_failed = 0; // Flag to track write errors
     time_t current_time = time(NULL); // Get current time once
 
-    n = snprintf(buffer, sizeof(buffer), "--- Server Status ---\n");
-    if (n > 0 && write_all(output_fd, buffer, n) < 0) write_failed = 1;
+    bytes_written = snprintf(buffer, sizeof(buffer), "--- Server Status ---\n");
+    if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
 
     // --- Listening Sockets ---
     if (!write_failed) {
-        n = snprintf(buffer, sizeof(buffer), "Listening on: %s:%d\n",
+        bytes_written = snprintf(buffer, sizeof(buffer), "Listening on: %s:%d\n",
                 cfg->bind_addr[0] ? cfg->bind_addr : "0.0.0.0 (All Interfaces)",
                 cfg->port);
-        if (n > 0 && write_all(output_fd, buffer, n) < 0) write_failed = 1;
+        if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
     }
     // TODO: Add iteration for multiple sockets if implemented
 
     // --- Timeout Configuration ---
     if (!write_failed) {
         if (cfg->timeout_val > 0) {
-            n = snprintf(buffer, sizeof(buffer), "Client Inactivity Timeout: %d seconds\n", cfg->timeout_val);
+            bytes_written = snprintf(buffer, sizeof(buffer), "Client Inactivity Timeout: %d seconds\n", cfg->timeout_val);
         } else {
-            n = snprintf(buffer, sizeof(buffer), "Client Inactivity Timeout: Disabled\n");
+            bytes_written = snprintf(buffer, sizeof(buffer), "Client Inactivity Timeout: Disabled\n");
         }
-        if (n > 0 && write_all(output_fd, buffer, n) < 0) write_failed = 1;
+        if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
     }
 
 
     // --- Connected Clients ---
     if (!write_failed) {
-        n = snprintf(buffer, sizeof(buffer), "Connected Clients (%d):\n", client_count);
-        if (n > 0 && write_all(output_fd, buffer, n) < 0) write_failed = 1;
+        bytes_written = snprintf(buffer, sizeof(buffer), "Connected Clients (%d):\n", client_count);
+        if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
     }
 
     if (!write_failed) {
         if (client_count == 0) {
-            n = snprintf(buffer, sizeof(buffer), "  (None)\n");
-            if (n > 0 && write_all(output_fd, buffer, n) < 0) write_failed = 1;
+            bytes_written = snprintf(buffer, sizeof(buffer), "  (None)\n");
+            if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
         } else {
             for (int i = 0; i < client_count && !write_failed; ++i) {
                 if (clients[i]) { // Check if the slot is valid
@@ -486,36 +541,36 @@ static int print_stat(int output_fd, const Config *cfg, client_state **clients, 
                         inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
                         port = ntohs(addr.sin_port);
                         if (remaining >= 0) {
-                            n = snprintf(buffer, sizeof(buffer), "  - Client %d: fd=%d, Addr=%s:%d, Buf=%zu/%zu, Timeout=%.0fs\n",
+                            bytes_written = snprintf(buffer, sizeof(buffer), "  - Client %d: fd=%d, Addr=%s:%d, Buf=%zu/%zu, Timeout=%.0fs\n",
                                     i, fd, ip_str, port, clients[i]->buffer_size, clients[i]->buffer_capacity, remaining > 0 ? remaining : 0); // Show 0 if already timed out
                         } else { // Timeout disabled
-                             n = snprintf(buffer, sizeof(buffer), "  - Client %d: fd=%d, Addr=%s:%d, Buf=%zu/%zu, Timeout=N/A\n",
+                             bytes_written = snprintf(buffer, sizeof(buffer), "  - Client %d: fd=%d, Addr=%s:%d, Buf=%zu/%zu, Timeout=N/A\n",
                                     i, fd, ip_str, port, clients[i]->buffer_size, clients[i]->buffer_capacity);
                         }
                     } else {
                         // Log error getting peer name, but still print basic info
                         log_perror("getpeername failed for fd"); // Note: log_perror might not be ideal in child
                          if (remaining >= 0) {
-                            n = snprintf(buffer, sizeof(buffer), "  - Client %d: fd=%d, Addr=(Error), Buf=%zu/%zu, Timeout=%.0fs\n",
+                            bytes_written = snprintf(buffer, sizeof(buffer), "  - Client %d: fd=%d, Addr=(Error), Buf=%zu/%zu, Timeout=%.0fs\n",
                                     i, fd, clients[i]->buffer_size, clients[i]->buffer_capacity, remaining > 0 ? remaining : 0);
                          } else {
-                             n = snprintf(buffer, sizeof(buffer), "  - Client %d: fd=%d, Addr=(Error), Buf=%zu/%zu, Timeout=N/A\n",
+                             bytes_written = snprintf(buffer, sizeof(buffer), "  - Client %d: fd=%d, Addr=(Error), Buf=%zu/%zu, Timeout=N/A\n",
                                     i, fd, clients[i]->buffer_size, clients[i]->buffer_capacity);
                          }
                     }
-                     if (n > 0 && write_all(output_fd, buffer, n) < 0) write_failed = 1;
+                     if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
 
                 } else {
-                     n = snprintf(buffer, sizeof(buffer), "  - Client %d: (Invalid state pointer)\n", i);
-                     if (n > 0 && write_all(output_fd, buffer, n) < 0) write_failed = 1;
+                     bytes_written = snprintf(buffer, sizeof(buffer), "  - Client %d: (Invalid state pointer)\n", i);
+                     if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
                 }
             }
         }
     }
 
     if (!write_failed) {
-        n = snprintf(buffer, sizeof(buffer), "---------------------\n");
-        if (n > 0 && write_all(output_fd, buffer, n) < 0) write_failed = 1;
+        bytes_written = snprintf(buffer, sizeof(buffer), "---------------------\n");
+        if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
     }
 
     return write_failed ? -1 : 0; // Return -1 if any write failed
@@ -531,8 +586,7 @@ static int print_help(int output_fd) {
     int write_failed = 0;
 
     const char *help_lines[] = {
-        "Simple Shell (SPaASM Assignment 2)\n",
-        "Author: [Your Name/ID Here]\n", // <-- TODO: Update Author Name
+        "Author: [Matej Herzog]\n", // <-- TODO: Update Author Name
         // Updated Usage line
         "Usage: shell [-s|-c] [-p port] [-i bind_addr] [-v] [-l logfile] [-t timeout] [-d] [-h]\n",
         "  -s : Run in server mode (default)\n",
@@ -549,6 +603,7 @@ static int print_help(int output_fd) {
         "  quit : Disconnect from the server.\n",
         "  halt : Terminate the server process.\n",
         "  stat : Show server status (listening sockets, connected clients).\n\n",
+        "  abort n : Terminate the client with index n (0-based).\n",
         "Special Characters:\n",
         "  # : Start a comment (ignored).\n",
         "  ; : Separate commands to be executed sequentially.\n",

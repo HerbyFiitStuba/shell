@@ -10,8 +10,9 @@
 
 #define LOG_BUFFER_SIZE 1024 // Max size for a single log message line
 
-// Use STDERR_FILENO as the initial default
-static int log_fd = STDERR_FILENO;
+// Use separate file descriptors for default and debug logs
+static int default_log_fd = STDERR_FILENO;
+static int debug_log_fd = STDERR_FILENO;
 static int is_verbose = 0;
 
 // Helper function to handle write errors and ensure all bytes are written
@@ -37,7 +38,12 @@ static int write_all(int fd, const char *buf, size_t len) {
 
 int log_init(const char *path, int verbose) {
     is_verbose = verbose;
-    int new_fd = STDERR_FILENO; // Default to stderr
+    int new_fd = -1; // Initialize to invalid
+    int previous_default_fd = default_log_fd; // Store old fd to close later
+
+    // Reset FDs to defaults before attempting to open/set new ones
+    default_log_fd = -1;
+    debug_log_fd = STDERR_FILENO;
 
     // Check if path is not NULL and not an empty string
     if (path && path[0] != '\0') {
@@ -46,37 +52,46 @@ int log_init(const char *path, int verbose) {
         new_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (new_fd < 0) {
             // Report error to stderr.
-            dprintf(STDERR_FILENO, "ERROR: cannot open log file '%s': %s\n", path, strerror(errno));
-            // Keep new_fd as STDERR_FILENO (fallback)
-            new_fd = STDERR_FILENO;
-            // Return error to indicate the requested file wasn't opened
-            // return -1; // Decide if this should be a fatal error for the caller
+            dprintf(STDERR_FILENO, "ERROR: cannot open log file '%s': %s. Default logs disabled. Debug logs to stderr.\n", path, strerror(errno));
+            // Set default to invalid, debug to stderr (already set)
+            default_log_fd = -1;
+            // Keep debug_log_fd as STDERR_FILENO
         } else {
             // Use dprintf to stderr to report success
             dprintf(STDERR_FILENO, "INFO: Logging to file '%s' (fd %d)\n", path, new_fd);
+            // Set both default and debug to the new file descriptor
+            default_log_fd = new_fd;
+            debug_log_fd = new_fd;
         }
+    } else {
+         // No path provided, keep default and debug as STDERR_FILENO
+         dprintf(STDERR_FILENO, "INFO: No log file specified. We are not logging.\n");
     }
 
-    // If the current log_fd is a file (not stderr), close it.
-    if (log_fd != STDERR_FILENO && log_fd >= 0) {
-        if (close(log_fd) < 0) {
+    // Close the *previous* default log fd if it was a file (not stderr/stdout/stdin)
+    if (previous_default_fd > STDERR_FILENO) {
+        if (close(previous_default_fd) < 0) {
              // Report close error to original stderr
-             dprintf(STDERR_FILENO, "ERROR: Failed to close previous log descriptor %d: %s\n", log_fd, strerror(errno));
+             dprintf(STDERR_FILENO, "ERROR: Failed to close previous log descriptor %d: %s\n", previous_default_fd, strerror(errno));
              // Continue, but report the issue.
         }
     }
 
-    // Update the global log file descriptor
-    log_fd = new_fd;
-
-    // Log initialization message using the new log_fd
+    // Log initialization message using the new log settings
+    // Note: log_info itself checks if default_log_fd is valid
     log_info("Logger initialized. Verbose: %s.", verbose ? "enabled" : "disabled");
 
-    return 0; // Return success (even if fallback to stderr occurred)
+    // Return success, even if file opening failed (we fall back gracefully)
+    return 0;
 }
 
-// Generic log function using varargs - ensures atomic write
-static void log_generic(const char *level, const char *fmt, va_list ap) {
+// Generic log function using varargs - ensures atomic write to the specified fd
+static void log_generic(int fd, const char *level, const char *fmt, va_list ap) {
+    // If the target fd is invalid, do nothing.
+    if (fd < 0) {
+        return;
+    }
+
     // Buffer to hold the complete formatted log message
     char log_buffer[LOG_BUFFER_SIZE];
     char time_buf[20]; // Buffer for "YYYY-MM-DD HH:MM:SS"
@@ -126,53 +141,73 @@ static void log_generic(const char *level, const char *fmt, va_list ap) {
         current_len++; // Include newline in length for write_all
     }
 
-    // Write the complete buffer in a single call for atomicity
-    write_all(log_fd, log_buffer, (size_t)current_len);
+    // Write the complete buffer in a single call for atomicity to the specified fd
+    write_all(fd, log_buffer, (size_t)current_len);
 }
 
 
 void log_info(const char *fmt, ...) {
+    // Do not log if the default fd is invalid
+    if (default_log_fd < 0) return;
     va_list ap;
     va_start(ap, fmt);
-    log_generic("INFO", fmt, ap);
+    log_generic(default_log_fd, "INFO", fmt, ap);
     va_end(ap);
 }
 
 void log_error(const char *fmt, ...) {
+    // Do not log if the default fd is invalid
+    if (default_log_fd < 0) return;
     va_list ap;
     va_start(ap, fmt);
-    log_generic("ERROR", fmt, ap);
+    log_generic(default_log_fd, "ERROR", fmt, ap);
     va_end(ap);
 }
 
 // Log error including the system error message for errno
 void log_perror(const char *msg) {
+    // Do not log if the default fd is invalid
+    if (default_log_fd < 0) return;
     // Get the error message before doing anything else that might change errno
     char *err_str = strerror(errno);
-    // Use log_error to format the combined message
+    // Use log_error to format the combined message (which checks default_log_fd again)
     log_error("%s: %s", msg, err_str);
 }
 
 
 void log_debug(const char *fmt, ...) {
-    if (!is_verbose) return;
+    // Do not log if verbose is off or the debug fd is invalid
+    if (!is_verbose || debug_log_fd < 0) return;
 
     va_list ap;
     va_start(ap, fmt);
-    log_generic("DEBUG", fmt, ap);
+    log_generic(debug_log_fd, "DEBUG", fmt, ap);
     va_end(ap);
 }
 
 void log_close(void) {
-    log_info("Closing logger."); // Log closing message before actually closing
-    // Only close if it's a valid file descriptor and not stderr
-    if (log_fd != STDERR_FILENO && log_fd >= 0) {
-        if (close(log_fd) < 0) {
+    log_info("Closing logger."); // Log closing message before actually closing (uses default_log_fd)
+
+    // int closed_default = 0;
+    // Close default log descriptor if it's a file descriptor ( > STDERR_FILENO)
+    if (default_log_fd > STDERR_FILENO) {
+        if (close(default_log_fd) < 0) {
             // Report close error to original stderr using dprintf
-            dprintf(STDERR_FILENO, "ERROR: Failed to close log descriptor %d: %s\n", log_fd, strerror(errno));
+            dprintf(STDERR_FILENO, "ERROR: Failed to close default log descriptor %d: %s\n", default_log_fd, strerror(errno));
+        }
+        //closed_default = 1; // Mark as closed (or attempted to close)
+    }
+
+    // Close debug log descriptor if it's a file descriptor and *different* from the default one we just closed
+    if (debug_log_fd > STDERR_FILENO && debug_log_fd != default_log_fd) {
+         if (close(debug_log_fd) < 0) {
+            // Report close error to original stderr using dprintf
+            dprintf(STDERR_FILENO, "ERROR: Failed to close debug log descriptor %d: %s\n", debug_log_fd, strerror(errno));
         }
     }
-    // Reset to default state
-    log_fd = STDERR_FILENO;
+
+    // Reset to initial/error state
+    default_log_fd = -1; // Set default to invalid after close
+    debug_log_fd = STDERR_FILENO; // Reset debug to stderr
     is_verbose = 0;
 }

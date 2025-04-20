@@ -17,6 +17,7 @@
 #include <signal.h>     // Added for sig_atomic_t
 #include <stdio.h>      // For snprintf (dprintf removed)
 #include <time.h>       // For time()
+#include <limits.h> // For strtol validation
 
 #define WRITE_BUFFER_SIZE 512 // Buffer for formatting messages before write_all
 
@@ -169,7 +170,7 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 0; // Indicate success
 }
 
-// Handle data received from a client (No changes needed in this function itself)
+// Handle data received from a client
 static void handle_client_read(int fd, int epoll_fd, const Config *cfg) {
     int index = find_client_index(fd);
     if (index == -1) {
@@ -241,7 +242,7 @@ static void handle_client_read(int fd, int epoll_fd, const Config *cfg) {
     char *line_start = client->buffer;
     char *newline_pos;
     char msg_buf[WRITE_BUFFER_SIZE]; // Buffer for messages
-    int n; // For snprintf return value
+    int msg_len; // Renamed from to_write_n
 
     while ((newline_pos = memchr(line_start, '\n', client->buffer_size - (line_start - client->buffer))) != NULL) {
         // size_t line_len = newline_pos - line_start;
@@ -252,79 +253,113 @@ static void handle_client_read(int fd, int epoll_fd, const Config *cfg) {
         // --- Replace echo with parsing and execution ---
         log_debug("Received line from fd %d: %s", fd, line_start);
         
+        Token *tokens = NULL;
+        Command *cmd_sequence = NULL;
+        int exec_result = EXEC_OK; // Default result
+
         // 1. Tokenize
-        Token *tokens = tokenize(line_start);
+        tokens = tokenize(line_start);
         if (tokens == NULL) {
             log_error("Tokenizer failed for input from fd %d", fd);
-            // Optionally send an error message back to the client
-            n = snprintf(msg_buf, sizeof(msg_buf), "Error: Tokenization failed.\n");
-            if (n > 0) write_all(fd, msg_buf, n);
-            // Continue to next line or handle error further
+            msg_len = snprintf(msg_buf, sizeof(msg_buf), "Error: Tokenization failed.\n");
+            if (msg_len > 0) write_all(fd, msg_buf, msg_len);
+            exec_result = EXEC_ERROR; // Mark as error to skip further processing this line
         } else {
             // 2. Parse
-            Command *cmd_sequence = parse(tokens);
+            cmd_sequence = parse(tokens);
             if (cmd_sequence == NULL) {
                 log_error("Parser failed for input from fd %d", fd);
-                // Parser already prints syntax errors to stderr
-                // Optionally send a generic error message back to the client
-                n = snprintf(msg_buf, sizeof(msg_buf), "Error: Command parsing failed (syntax error?).\n");
-                if (n > 0) write_all(fd, msg_buf, n);
+                msg_len = snprintf(msg_buf, sizeof(msg_buf), "Error: Command parsing failed (syntax error?).\n");
+                if (msg_len > 0) write_all(fd, msg_buf, msg_len);
+                exec_result = EXEC_ERROR; // Mark as error
             } else {
                 // 3. Execute
                 log_debug("Executing command sequence for fd %d", fd);
-                // Pass cfg, clients, and client_count to the executor
-                int exec_result = execute_command_sequence(cmd_sequence, fd, cfg, clients, client_count);
+                exec_result = execute_command_sequence(cmd_sequence, fd, cfg, clients, client_count);
                 log_debug("Execution finished for fd %d with result %d", fd, exec_result);
-        
-                // Handle execution results
-                if (exec_result == EXEC_QUIT) {
-                    log_info("Client fd %d requested quit.", fd);
-                    remove_client(fd, epoll_fd); // Close connection
-                    free_command_sequence(cmd_sequence); // Free parsed structure
-                    free_tokens(tokens);                 // Free tokens
-                    return; // Stop processing buffer for this client
-                } else if (exec_result == EXEC_HALT) {
-                    log_info("Halt command received from fd %d. Initiating server shutdown.", fd);
-                    // Need a way to signal the main loop in server_run to break
-                    // This might involve setting a global flag or using a pipe/signal
-                    // For now, just log it. A proper implementation needs server loop modification.
-                    // Example: Set a global flag `static volatile sig_atomic_t halt_requested = 0;`
-                    //          and check it in the server_run loop.
-                    halt_requested = 1; // Set the global flag to signal shutdown
-                    n = snprintf(msg_buf, sizeof(msg_buf), "Server halt initiated.\n"); // Inform client
-                    if (n > 0) write_all(fd, msg_buf, n);
-                    // The main loop will detect the flag and break
-                } else if (exec_result == EXEC_ERROR) {        
-                    log_error("Critical execution error for fd %d.", fd);
-                    // Error message should have been sent to client via stderr redirection
-                    // dprintf(fd, "Error: Command execution failed.\n"); // Optional generic message
-                }
-                // Free parsed structure if execution didn't cause immediate return
-                free_command_sequence(cmd_sequence);
             }
-            // Free tokens if parsing didn't cause immediate return
-            free_tokens(tokens);
         }
-        // --- End parsing and execution section ---
 
-        // Restore newline if needed, though not strictly necessary as we advance past it
-        // *newline_pos = '\n';
+        // Handle execution results
+        if (exec_result == EXEC_QUIT) {
+            log_info("Client fd %d requested quit.", fd);
+            remove_client(fd, epoll_fd); // Close connection
+            free_command_sequence(cmd_sequence); // Free parsed structure
+            free_tokens(tokens);                 // Free tokens
+            return; // Stop processing buffer for this client
+        } else if (exec_result == EXEC_HALT) {
+            log_info("Halt command received from fd %d. Initiating server shutdown.", fd);
+            halt_requested = 1; // Set the global flag to signal shutdown
+            msg_len = snprintf(msg_buf, sizeof(msg_buf), "Server halt initiated.\n"); // Inform client
+            if (msg_len > 0) write_all(fd, msg_buf, msg_len);
+            // The main loop will detect the flag and break
+        } else if (exec_result == EXEC_ABORT_N) {
+            // Executor already validated the command and arguments
+            char *endptr;
+            errno = 0;
+            long target_index_long = strtol(cmd_sequence->argv[1], &endptr, 10);
+            // Basic check again in case of race conditions or memory issues
+            if (errno == 0 && endptr != cmd_sequence->argv[1] && *endptr == '\0' && target_index_long >= 0 && target_index_long < client_count && target_index_long <= INT_MAX) {
+                int target_index = (int)target_index_long;
+                if (clients[target_index] != NULL) { // Check if target client still exists
+                    int target_fd = clients[target_index]->fd;
+                    log_info("Client fd %d requested abort for client index %d (fd %d).", fd, target_index, target_fd);
 
-        // Advance line_start past the processed line (including the newline)
+                    // Inform the target client (best effort)
+                    msg_len = snprintf(msg_buf, sizeof(msg_buf), "Connection aborted by server administrator.\n");
+                    if (msg_len > 0) {
+                        write_all(target_fd, msg_buf, msg_len); // Ignore error, client might be gone
+                    }
+
+                    // Remove the target client
+                    remove_client(target_fd, epoll_fd);
+
+                    // Check if the current client aborted itself
+                    if (target_fd == fd) {
+                        log_info("Client fd %d aborted itself.", fd);
+                        free_command_sequence(cmd_sequence); // Free parsed structure
+                        free_tokens(tokens);                 // Free tokens
+                        return; // Stop processing, current client state is gone
+                    }
+                } else {
+                    log_error("Client fd %d tried to abort client index %d, but client no longer exists.", fd, target_index);
+                    msg_len = snprintf(msg_buf, sizeof(msg_buf), "Error: Client with index %d no longer exists.\n", target_index);
+                    if (msg_len > 0) write_all(fd, msg_buf, msg_len);
+                }
+            } else {
+                // Should not happen if executor validation is correct, but log defensively
+                log_error("Internal error: Invalid index '%s' received from executor for abort command from fd %d.", cmd_sequence->argv[1], fd);
+            }
+        } else if (exec_result == EXEC_ERROR) {
+            log_error("Execution error occurred for fd %d.", fd);
+            // Error message should have been sent by executor or parser
+        }
+        // If exec_result == EXEC_OK or other non-terminal results, continue normally
+
+        // Free structures for the processed command/line
+        free_command_sequence(cmd_sequence);
+        free_tokens(tokens);
+
+        // Advance line_start past the processed line (including the null terminator)
         line_start = newline_pos + 1;
 
-        // --- Send prompt after processing command ---
-        const char *prompt = generate_prompt();
-        ssize_t prompt_len = strlen(prompt);
-        // Use write_all for prompt as well for consistency
-        if (write_all(fd, prompt, prompt_len) < 0) {
-             // write_all logs errors internally, check errno if needed
-             if (errno == EPIPE) {
-                 log_info("Client fd %d disconnected (Broken Pipe on prompt write)", fd);
-                 remove_client(fd, epoll_fd);
-                 return; // Client gone
-             }
-             // If EAGAIN/EWOULDBLOCK (less likely with write_all), or other errors logged by write_all
+        // --- Send prompt after processing command (only if client wasn't removed) ---
+        // Check if the client still exists (it might have quit or aborted itself)
+        if (find_client_index(fd) != -1) {
+            const char *prompt = generate_prompt();
+            ssize_t prompt_len = strlen(prompt);
+            if (write_all(fd, prompt, prompt_len) < 0) {
+                 if (errno == EPIPE) {
+                     log_info("Client fd %d disconnected (Broken Pipe on prompt write)", fd);
+                     remove_client(fd, epoll_fd);
+                     return; // Client gone
+                 }
+                 // Other errors handled by write_all
+            }
+        } else {
+            // Client was removed (quit/abort self), stop processing buffer for this fd
+            log_debug("Client fd %d removed, stopping prompt send.", fd);
+            return;
         }
         // --- End prompt sending ---
 
@@ -552,7 +587,7 @@ void server_run(const Config *cfg) { // Pass cfg as const pointer
         // --- Check for Client Timeouts (runs after processing events or timeout) ---
         time_t current_time = time(NULL);  // time(NULL) gets the current time
         char msg_buf[WRITE_BUFFER_SIZE]; // Buffer for timeout message
-        int msg_len; // Renamed from n
+        int msg_len; 
 
         // Iterate backwards to allow safe removal while iterating
         for (int i = client_count - 1; i >= 0; --i) {

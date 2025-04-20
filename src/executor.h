@@ -12,6 +12,7 @@
 #define EXEC_QUIT            2  // 'quit' command was executed, client connection should close
 #define EXEC_IS_PROPAGABLE   3  // Command is a built-in whose output can be piped
 #define EXEC_NOT_BUILTIN     4  // Command is not a built-in
+#define EXEC_ABORT_N         5  // 'abort n' command was executed, server should disconnect client n
 
 /**
  * @brief Executes a parsed command sequence received from a client.
