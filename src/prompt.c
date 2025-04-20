@@ -16,11 +16,14 @@
 #endif
 #endif
 
+#define TIME_BUF_SIZE 6 // HH:MM + null terminator
+#define PROMPT_BUF_SIZE 512 // Buffer size for the prompt string
+
 
 // Generate the prompt string: HH:MM user@host#
 const char* generate_prompt(void) {
-    static char prompt_buf[256]; // Static buffer to hold the prompt
-    char time_buf[6];            // HH:MM + null terminator
+    static char prompt_buf[PROMPT_BUF_SIZE]; // Static buffer to hold the prompt
+    char time_buf[TIME_BUF_SIZE];            // HH:MM + null terminator
     char hostname[HOST_NAME_MAX + 1];  // Buffer for hostname
     char *username = NULL;       // Pointer for username
     time_t now;               // Current time

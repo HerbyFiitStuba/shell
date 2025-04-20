@@ -3,11 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h> // For errno with strtol
-#include <limits.h> // For INT_MAX, LONG_MIN, LONG_MAX with strtol
-#include <getopt.h> // For getopt() and associated variables like optarg
-
-// Note: getopt is usually included via unistd.h or getopt.h on POSIX systems
+#include <errno.h>   // For errno with strtol
+#include <limits.h>  // For INT_MAX, LONG_MIN, LONG_MAX with strtol
+#include <getopt.h>  // For getopt() and associated variables like optarg
 
 // These are typically declared by including unistd.h or getopt.h
 // extern char *optarg;
@@ -22,8 +20,6 @@ void init_default_config(Config *cfg) {
     cfg->timeout_val = 0;   // Default timeout not set by arg (0 seconds)
     cfg->daemonize = 0;   // Default: do not daemonize
 }
-
-// Removed free_config_memory function
 
 void load_args(int argc, char **argv, Config *cfg) {
     int opt;
@@ -117,7 +113,7 @@ void load_args(int argc, char **argv, Config *cfg) {
                 char *endptr;
                 long val;
                 errno = 0; // Reset errno before call
-                val = strtol(optarg, &endptr, 10);
+                val = strtol(optarg, &endptr, 10);  
 
                 // Check for errors: empty string, non-numeric chars, out of range (allow 0)
                 if (errno != 0 || endptr == optarg || *endptr != '\0' || val < 0 || val > INT_MAX) {

@@ -15,15 +15,14 @@ typedef struct {
 } client_state;
 
 /**
- * @brief Vytvorí a nakonfiguruje TCP posluchový socket.
- * @param cfg Ukazovateľ na konfiguráciu (port, bind_addr).
- * @return fd socketu >=0, alebo -1 pri chybe (log_error už zaloguje).
+ * @brief Creates and configures a TCP listening socket.
+ * @param cfg Pointer to the configuration (port, bind_addr).
  */
 int socket_setup(const Config *cfg);
 
 /**
- * @brief Spustí serverovú slučku: accept, read-line, echo, close.
- * @param cfg Ukazovateľ na konfiguráciu.
+ * @brief Starts the server loop, accepting and handling client connections.
+ * @param cfg Pointer to the configuration.
  */
 void server_run(const Config *cfg);
 

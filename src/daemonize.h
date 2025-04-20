@@ -4,7 +4,7 @@
 /**
  * @brief Daemonizes the current process.
  *
- * Performs the standard steps to detach the process from the controlling
+ * Performs steps to detach the process from the controlling
  * terminal and run it in the background as a daemon.
  * This includes forking, creating a new session,
  * and closing/redirecting standard file descriptors.

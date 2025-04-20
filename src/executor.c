@@ -71,18 +71,16 @@ static int write_all(int fd, const char *buf, size_t len) {
         ssize_t written = write(fd, buf + total_written, len - total_written);
         if (written < 0) {
             if (errno == EINTR) continue; // Interrupted system call, try again
-            // Log error, but don't use log_perror directly as it might interfere
-            // if stderr itself is redirected in complex ways. Write to original stderr.
             char err_buf[256];
             snprintf(err_buf, sizeof(err_buf), "ERROR: write failed in write_all (fd=%d): %s\n", fd, strerror(errno));
-            write(STDERR_FILENO, err_buf, strlen(err_buf)); // Use raw write to stderr
+            write(STDERR_FILENO, err_buf, strlen(err_buf)); // write error message to stderr
             return -1; // Indicate failure
         }
         if (written == 0 && len > 0) {
-            // This shouldn't typically happen for blocking sockets/pipes unless fd is closed.
+            // This shouldn't happen but we handle it for safety measures
             char err_buf[128];
             snprintf(err_buf, sizeof(err_buf), "ERROR: write returned 0 unexpectedly (fd=%d)\n", fd);
-            write(STDERR_FILENO, err_buf, strlen(err_buf));
+            write(STDERR_FILENO, err_buf, strlen(err_buf)); // write error message to stderr
             return -1; // Indicate failure
         }
         total_written += (size_t)written;
@@ -123,7 +121,7 @@ static int execute_pipeline(Command *pipeline_head, int client_fd, const Config 
         if (pipeline_head->next_command_in_pipeline == NULL) {
             // 'abort' must be a single command
             log_debug("Processing 'abort n' command from fd %d", client_fd);
-            // Validate arguments: must have exactly one argument (the index)
+            // Validate arguments: must have exactly one argument 
             if (pipeline_head->argv[1] == NULL) {
                 log_error("Invalid 'abort' usage: requires exactly one argument (client index).");
                 err_len = snprintf(err_msg, sizeof(err_msg), "Error: Usage: abort <client_index>\n");
@@ -159,8 +157,6 @@ static int execute_pipeline(Command *pipeline_head, int client_fd, const Config 
 
 
     // --- Proceed with pipeline execution for propagable built-ins or external commands ---
-    // (first_cmd_type is EXEC_IS_PROPAGABLE or EXEC_NOT_BUILTIN)
-
     int num_cmds = 0;
     Command *cmd_iter = pipeline_head;
     while (cmd_iter != NULL) {
@@ -235,9 +231,9 @@ static int execute_pipeline(Command *pipeline_head, int client_fd, const Config 
             exit(EXIT_FAILURE); // Should not be reached
 
         } else {
-            // --- Parent Process (minimal logic in loop) ---
+            // --- Parent Process ---
             log_debug("Forked child %d (pid %d) for command '%s'", i, pids[i], cmd_iter->argv[0]);
-            // Parent does NOT close pipe ends here anymore
+            // Parent does NOT close pipe ends here
         }
         cmd_iter = cmd_iter->next_command_in_pipeline;
     } // End for loop creating children
@@ -263,10 +259,15 @@ static int execute_pipeline(Command *pipeline_head, int client_fd, const Config 
             if (WIFEXITED(status)) {
                 log_debug("Child pid %d exited with status %d", pids[i], WEXITSTATUS(status));
                 if (WEXITSTATUS(status) != 0) {
-                    // Optionally report non-zero exit status as an error or info
-                    // final_result = EXEC_ERROR; // Decide if any non-zero exit is an error
-                    // Let's not treat non-zero exit as EXEC_ERROR for now,
-                    // unless it was due to a signal.
+                    log_error("Child pid %d exited with error status %d", pids[i], WEXITSTATUS(status));
+                    // Check if this was a built-in that failed
+                    if (first_cmd_type == EXEC_IS_PROPAGABLE) {
+                        final_result = EXEC_ERROR; // Mark error for propagable built-ins
+                    } else {
+                        final_result = WEXITSTATUS(status); // Propagate the exit status
+                    }
+                } else {
+                    log_debug("Child pid %d exited successfully.", pids[i]);
                 }
             } else if (WIFSIGNALED(status)) {
                 log_error("Child pid %d terminated by signal %d", pids[i], WTERMSIG(status));
@@ -286,16 +287,14 @@ static int execute_pipeline(Command *pipeline_head, int client_fd, const Config 
  * @brief Checks if a command is a built-in and returns its type.
  * Does NOT execute the built-in here, only identifies it.
  * @param cmd The command structure.
- * @param client_fd The client's file descriptor (unused in this version).
- * @param cfg Server configuration (unused in this version).
- * @param clients Array of client states (unused in this version).
- * @param client_count Number of clients (unused in this version).
+ * @param client_fd The client's file descriptor.
+ * @param cfg Server configuration.
+ * @param clients Array of client states.
+ * @param client_count Number of clients.
  * @return EXEC_QUIT, EXEC_HALT, EXEC_ABORT_N, EXEC_IS_PROPAGable, or EXEC_NOT_BUILTIN.
  */
-// Updated signature and logic
 static int handle_builtin(Command *cmd, int client_fd, const Config *cfg, client_state **clients, int client_count) {
     // Parameters client_fd, cfg, clients, client_count are unused now,
-    // but kept for potential future built-ins that might need them even for identification.
     (void)client_fd;
     (void)cfg;
     (void)clients;
@@ -330,20 +329,19 @@ static int handle_builtin(Command *cmd, int client_fd, const Config *cfg, client
  * It calls exit() on failure or after successful built-in execution.
  *
  * @param cmd The command to execute.
- * @param client_fd The client's socket fd (used for default error output if not redirected).
- * @param pipe_in_fd Read end of the input pipe for this child, or -1 if none.
- * @param pipe_out_fd Write end of the output pipe for this child, or -1 if none.
+ * @param client_fd The client's socket fd.
+ * @param pipe_in_fd Read end of the input pipe.
+ * @param pipe_out_fd Write end of the output pipe.
  * @param all_pipe_fds Array containing all pipe FDs created by the parent.
  * @param num_pipes Total number of pipes created.
- * @param cfg Server configuration (for built-ins).
- * @param clients Array of client states (for built-ins).
- * @param client_count Number of clients (for built-ins).
+ * @param cfg Server configuration.
+ * @param clients Array of client states.
+ * @param client_count Number of clients.
  */
-// Added server state parameters
 static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_out_fd, int (*all_pipe_fds)[2], int num_pipes, const Config *cfg, client_state **clients, int client_count) {
     log_debug("Child (pid %d) setting up for command '%s'", getpid(), cmd->argv[0]);
     char err_msg[WRITE_BUFFER_SIZE]; // Buffer for error messages
-    int err_len; // Renamed from n
+    int err_len; 
 
     // --- Input Redirection ---
     if (cmd->input_file) {
@@ -366,10 +364,9 @@ static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_
         log_debug("Redirecting STDIN from pipe_in_fd: %d", pipe_in_fd);
         if (dup2(pipe_in_fd, STDIN_FILENO) == -1) {
             log_perror("dup2 STDIN from pipe failed");
-            // Don't close pipe_in_fd here, full cleanup below
             exit(EXIT_FAILURE);
         }
-        // Don't close pipe_in_fd yet, will be closed in the loop below
+        // No need to close pipe_in_fd here, will be closed in the loop below
     }
     // Else: STDIN remains default
 
@@ -383,7 +380,6 @@ static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_
         int fd_out = open(cmd->output_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (fd_out == -1) {
             log_perror("open output file failed");
-            // Error message will go to original stderr (client_fd or pipe)
             // Use write_all for error message
             err_len = snprintf(err_msg, sizeof(err_msg), "Error opening output file '%s': %s\n", cmd->output_file, strerror(errno));
              // Write to STDERR_FILENO which might be client_fd or a pipe write end
@@ -406,16 +402,13 @@ static void do_exec_child(Command *cmd, int client_fd, int pipe_in_fd, int pipe_
         log_debug("Redirecting STDOUT to pipe_out_fd: %d", pipe_out_fd);
         if (dup2(pipe_out_fd, STDOUT_FILENO) == -1) {
             log_perror("dup2 STDOUT to pipe failed");
-            // Don't close pipe_out_fd here yet
             exit(EXIT_FAILURE);
         }
         // Redirect STDERR to client
         if (dup2(client_fd, STDERR_FILENO) == -1) {
              log_perror("dup2 STDERR to client_fd failed");
-             // Don't close pipe_out_fd here yet
              exit(EXIT_FAILURE);
         }
-        // Don't close pipe_out_fd yet, will be closed in the loop below
     } else {
         // No output file, no output pipe -> redirect STDOUT and STDERR to client
         log_debug("Redirecting STDOUT/STDERR to client_fd: %d", client_fd);
@@ -503,7 +496,6 @@ static int print_stat(int output_fd, const Config *cfg, client_state **clients, 
                 cfg->port);
         if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
     }
-    // TODO: Add iteration for multiple sockets if implemented
 
     // --- Timeout Configuration ---
     if (!write_failed) {
@@ -514,7 +506,6 @@ static int print_stat(int output_fd, const Config *cfg, client_state **clients, 
         }
         if (bytes_written > 0 && write_all(output_fd, buffer, bytes_written) < 0) write_failed = 1;
     }
-
 
     // --- Connected Clients ---
     if (!write_failed) {
@@ -581,13 +572,11 @@ static int print_stat(int output_fd, const Config *cfg, client_state **clients, 
  * @brief Prints help information to the specified file descriptor using write().
  * @return 0 on success, -1 on failure.
  */
-// Updated signature and implementation
 static int print_help(int output_fd) {
     int write_failed = 0;
 
     const char *help_lines[] = {
-        "Author: [Matej Herzog]\n", // <-- TODO: Update Author Name
-        // Updated Usage line
+        "Author: [Matej Herzog]\n", 
         "Usage: shell [-s|-c] [-p port] [-i bind_addr] [-v] [-l logfile] [-t timeout] [-d] [-h]\n",
         "  -s : Run in server mode (default)\n",
         "  -c : Run in client mode\n",
@@ -596,7 +585,7 @@ static int print_help(int output_fd) {
         "  -v : Enable verbose output to stderr\n",
         "  -l file : Log output to specified file (default: stderr)\n",
         "  -t secs : Client inactivity timeout in seconds (default: 600)\n",
-        "  -d : Run server as a daemon process\n", // Added daemon description
+        "  -d : Run server as a daemon process\n", 
         "  -h : Display this help message\n\n",
         "Built-in Commands:\n",
         "  help : Display this help message.\n",
@@ -610,14 +599,11 @@ static int print_help(int output_fd) {
         "  | : Pipe the output of one command to the input of the next.\n",
         "  < file : Redirect standard input from a file.\n",
         "  > file : Redirect standard output to a file (overwrite).\n",
-        NULL // Sentinel
+        NULL // End of help lines
     };
 
     for (int i = 0; help_lines[i] != NULL && !write_failed; ++i) {
-        // In this simple case, the lines are already formatted, just write them.
-        // If formatting were needed:
-        // n = snprintf(buffer, sizeof(buffer), "%s", help_lines[i]);
-        // if (n > 0 && write_all(output_fd, buffer, n) < 0) write_failed = 1;
+        // Use write_all to handle partial writes and errors
         if (write_all(output_fd, help_lines[i], strlen(help_lines[i])) < 0) {
             write_failed = 1;
         }

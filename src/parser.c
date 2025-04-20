@@ -170,15 +170,14 @@ Command *parse(Token *tokens) {
                 break; // Break case TOKEN_PIPE
 
             case TOKEN_SEMICOLON: // ;
-                 // Syntax Check: Ensure there was a command before the semicolon, unless the previous token was also a semicolon.
+                 // Syntax Check: Ensure there was a command before the semicolon
                  if (!current_cmd || !current_cmd->argv || !current_cmd->argv[0]) {
                       // This catches `| ;`, `< file ;`, `> file ;` and start ` ; cmd`
-                      if (prev_type != TOKEN_SEMICOLON) { // Allow `;;` by ignoring the second one if the first was valid.
+                      if (prev_type != TOKEN_SEMICOLON) { 
                            fprintf(stderr, "Syntax error: Unexpected semicolon ';' without a preceding valid command.\n");
                            error_occurred = true;
                            break; // Break switch
                       }
-                      // If prev_type was ';', effectively ignore the current ';'. current_cmd remains NULL.
                  }
 
                  // If the command preceding ';' was valid, link the pipeline.
@@ -192,17 +191,15 @@ Command *parse(Token *tokens) {
 
                     // Link the completed pipeline to the sequence list
                     if (current_pipeline_head) { // Should always be true if current_cmd is valid
-                        if (head_sequence == NULL) {
-                            head_sequence = current_pipeline_head;
+                        if (head_sequence == NULL) {  // First sequence added
+                            head_sequence = current_pipeline_head;  
                             tail_sequence = current_pipeline_head;
                         } else {
                             // Ensure tail_sequence is valid before dereferencing
                             if (tail_sequence) {
-                                tail_sequence->next_command_sequence = current_pipeline_head;
-                                //tail_sequence = current_pipeline_tail; // Tail of sequence is tail of last pipeline added
-                                //should be current_pipeline_head
-                                tail_sequence = current_pipeline_head;
-                                if (last_sequence_pipeline_tail) {
+                                tail_sequence->next_command_sequence = current_pipeline_head;  // Link the last pipeline
+                                tail_sequence = current_pipeline_head;  // Update tail_sequence to the new end
+                                if (last_sequence_pipeline_tail) {      // reference next command sequence in the last pipeline element
                                     last_sequence_pipeline_tail->next_command_sequence = current_pipeline_head;
                                 } else{
                                     // This should not happen if the logic is correct
@@ -279,9 +276,6 @@ Command *parse(Token *tokens) {
 
     // --- Cleanup on Error OR Finalize ---
     if (error_occurred) {
-        // Determine if current_pipeline_head needs separate freeing.
-        // This is needed if it exists and is not the start of any sequence
-        // already linked into head_sequence.
         bool free_current_pipeline_separately = false;
         if (current_pipeline_head) {
             bool linked_to_head = false;
@@ -326,7 +320,6 @@ Command *parse(Token *tokens) {
                 }
             }
         }
-        // else: No final pipeline to link (e.g., input ended with ';')
 
         // Success
         return head_sequence;
@@ -402,8 +395,6 @@ static int add_argument(Command *cmd, const char *arg) {
     cmd->argv[argc] = strdup(arg);
     if (!cmd->argv[argc]) {
         perror("Failed to duplicate argument string");
-        // Need to decide how to handle this - shrink argv back? Or just fail?
-        // For now, just mark failure. The caller might need to clean up.
         cmd->argv[argc] = NULL; // Keep it NULL terminated
         return -1;
     }

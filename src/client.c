@@ -46,25 +46,31 @@ int client_run(Config *cfg) {
     int sockfd;
     struct sockaddr_in serv_addr;
 
-    // Create TCP socket (Still IPv4 only based on this structure)
+    // Create TCP socket (IPv4 only based on this structure)
+    // AF_INET is for IPv4, SOCK_STREAM is for TCP
     if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         log_perror("socket");
         return -1;
     }
 
     // Prepare server address structure
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(cfg->port);
+    memset(&serv_addr, 0, sizeof(serv_addr));  // Zero out the structure
+    serv_addr.sin_family = AF_INET;            // IPv4
+    // The htons function converts the unsigned short integer hostshort from host byte order to network byte order.
+    // Example: htons(80) converts 80 to network byte order (big-endian). 
+    serv_addr.sin_port = htons(cfg->port);     // Port number in network byte order
+
     // Using bind_addr as target host - consider renaming in Config for clarity
     const char *addr = cfg->bind_addr[0] ? cfg->bind_addr : "127.0.0.1";
+    // Convert IPv4 and IPv6 addresses from text to binary form
     if (inet_pton(AF_INET, addr, &serv_addr.sin_addr) <= 0) {
         log_error("Invalid address: %s", addr);
         close(sockfd);
         return -1;
     }
 
-    // Connect to server
+    // Connect to server, initiates connection to the server
+    // The connect() function establishes a connection to the specified socket.
     if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         log_perror("connect");
         close(sockfd);
@@ -73,34 +79,34 @@ int client_run(Config *cfg) {
     log_info("Connected to %s:%d", addr, cfg->port);
 
     // Main loop: multiplex stdin and socket using select()
-    fd_set readfds;
-    int maxfd;
+    fd_set readfds;  // File descriptor set for select, from <sys/select.h>
+    int maxfd;       // Maximum file descriptor for select
     char buf[BUFFER_SIZE]; // Use defined buffer size
     int stdin_open = 1; // Flag to track if stdin is still open
 
     while (1) {
-        FD_ZERO(&readfds);
+        FD_ZERO(&readfds);  // Clear the file descriptor set
         if (stdin_open) {
             FD_SET(STDIN_FILENO, &readfds); // Monitor stdin only if it's open
         }
-        FD_SET(sockfd, &readfds);
+        FD_SET(sockfd, &readfds);  // Monitor the socket for incoming data
 
         // Determine maxfd for select
-        maxfd = sockfd;
-        if (stdin_open && STDIN_FILENO > maxfd) {
-            maxfd = STDIN_FILENO;
+        maxfd = sockfd;  // sockfd is always monitored
+        if (stdin_open && STDIN_FILENO > maxfd) {  // Check if stdin is open and set maxfd accordingly
+            maxfd = STDIN_FILENO;  // Update maxfd if stdin is higher
         }
 
-        int ready = select(maxfd + 1, &readfds, NULL, NULL, NULL);
-        if (ready < 0) {
+        int ready = select(maxfd + 1, &readfds, NULL, NULL, NULL);  // Wait indefinitely for data
+        if (ready < 0) {  // select error
             if (errno == EINTR) continue; // Interrupted, restart select
             log_perror("select");
             break; // Exit on other select errors
         }
 
         // Data from server
-        if (FD_ISSET(sockfd, &readfds)) {
-            ssize_t n = read(sockfd, buf, sizeof(buf));
+        if (FD_ISSET(sockfd, &readfds)) {  // Check if sockfd is ready
+            ssize_t n = read(sockfd, buf, sizeof(buf));  // Read from server
             if (n < 0) {
                 log_perror("read from server");
                 break; // Exit on read error
@@ -116,8 +122,8 @@ int client_run(Config *cfg) {
         }
 
         // Input from user (stdin)
-        if (stdin_open && FD_ISSET(STDIN_FILENO, &readfds)) {
-            ssize_t n = read(STDIN_FILENO, buf, sizeof(buf)); // Use read instead of fgets
+        if (stdin_open && FD_ISSET(STDIN_FILENO, &readfds)) {  // Check if stdin is ready
+            ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));  // Use read instead of fgets
             if (n < 0) {
                 log_perror("read from stdin");
                 break; // Exit on stdin read error
@@ -142,6 +148,7 @@ int client_run(Config *cfg) {
     } // end while(1)
 
     log_info("Client loop finished. Closing socket.");
+    log_debug("Ending Client Program");
     close(sockfd);
     return 0;
 }
