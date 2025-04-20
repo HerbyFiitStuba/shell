@@ -2,12 +2,16 @@
 #define EXECUTOR_H
 
 #include "parser.h" // For the Command structure definition
+#include "config.h" // For Config structure
+#include "server.h" // For client_state structure
 
 // Define return codes for execute_command_sequence
-#define EXEC_OK      0  // Sequence completed successfully
-#define EXEC_ERROR  -1  // Critical error (e.g., fork failed, major setup issue)
-#define EXEC_HALT    1  // 'halt' command was executed, server should terminate
-#define EXEC_QUIT    2  // 'quit' command was executed, client connection should close
+#define EXEC_OK              0  // Sequence completed successfully
+#define EXEC_ERROR          -1  // Critical error (e.g., fork failed, major setup issue)
+#define EXEC_HALT            1  // 'halt' command was executed, server should terminate
+#define EXEC_QUIT            2  // 'quit' command was executed, client connection should close
+#define EXEC_IS_PROPAGABLE   3  // Command is a built-in whose output can be piped
+#define EXEC_NOT_BUILTIN     4  // Command is not a built-in
 
 /**
  * @brief Executes a parsed command sequence received from a client.
@@ -22,12 +26,15 @@
  * @param client_fd The file descriptor representing the connection to the client.
  *                  This is used for communication (reading commands is done elsewhere,
  *                  this is for sending output/errors back) and for the 'quit' command.
+ * @param cfg Pointer to the server's configuration.
+ * @param clients Pointer to the array of active client states.
+ * @param client_count The number of active clients in the clients array.
  * @return int Returns one of the EXEC_* codes:
  *             EXEC_OK: The entire sequence finished normally.
  *             EXEC_ERROR: A non-recoverable error occurred during execution setup (e.g., fork).
  *             EXEC_HALT: The 'halt' built-in was encountered.
  *             EXEC_QUIT: The 'quit' built-in was encountered for this client.
  */
-int execute_command_sequence(Command *cmd_sequence, int client_fd);
+int execute_command_sequence(Command *cmd_sequence, int client_fd, const Config *cfg, client_state **clients, int client_count);
 
 #endif // EXECUTOR_H

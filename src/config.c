@@ -4,7 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h> // For errno with strtol
-#include <limits.h> // For INT_MAX with strtol
+#include <limits.h> // For INT_MAX, LONG_MIN, LONG_MAX with strtol
 #include <getopt.h> // For getopt() and associated variables like optarg
 
 // Note: getopt is usually included via unistd.h or getopt.h on POSIX systems
@@ -19,6 +19,8 @@ void init_default_config(Config *cfg) {
     cfg->bind_addr[0] = '\0'; // Default to empty string (implies all interfaces)
     cfg->verbose   = 0;    // Default to verbose off
     cfg->log_path[0]  = '\0'; // Default to empty string (implies stderr)
+    cfg->timeout_val = 0;   // Default timeout not set by arg (0 seconds)
+    cfg->daemonize = 0;   // Default: do not daemonize
 }
 
 // Removed free_config_memory function
@@ -29,16 +31,20 @@ void load_args(int argc, char **argv, Config *cfg) {
 
     // opterr = 0; // Uncomment to disable getopt's default error messages
 
-    while ((opt = getopt(argc, argv, "hscp:i:vl:")) != -1) {
+    // Add 'd' to the optstring
+    while ((opt = getopt(argc, argv, "hscp:i:vl:t:d")) != -1) {
         switch (opt) {
             case 'h':
-                printf("Usage: %s [-s|-c] [-p port] [-i bind_addr] [-v] [-l logfile]\n", argv[0]);
+                // Update help message
+                printf("Usage: %s [-s|-c] [-p port] [-i bind_addr] [-v] [-l logfile] [-t timeout] [-d] [-h]\n", argv[0]);
                 printf("  -s : Run in server mode (default)\n");
                 printf("  -c : Run in client mode\n");
                 printf("  -p port : Port number (required for server, optional for client)\n");
                 printf("  -i addr : IP address to bind server to (default: all interfaces)\n");
                 printf("  -v : Enable verbose output\n");
                 printf("  -l file : Log output to specified file (default: stderr)\n");
+                printf("  -t secs : Client inactivity timeout in seconds (default: 600)\n");
+                printf("  -d : Run server as a daemon process\n"); // Added daemon option
                 printf("  -h : Display this help message\n");
                 exit(0);
             case 's':
@@ -107,6 +113,23 @@ void load_args(int argc, char **argv, Config *cfg) {
                  // If 0 <= n < sizeof(cfg->log_path), snprintf succeeded and null-terminated at cfg->log_path[n]
                 break;
             }
+            case 't': {
+                char *endptr;
+                long val;
+                errno = 0; // Reset errno before call
+                val = strtol(optarg, &endptr, 10);
+
+                // Check for errors: empty string, non-numeric chars, out of range (allow 0)
+                if (errno != 0 || endptr == optarg || *endptr != '\0' || val < 0 || val > INT_MAX) {
+                     fprintf(stderr, "Error: Invalid timeout value '%s'. Must be a non-negative integer.\n", optarg);
+                     exit(1);
+                }
+                cfg->timeout_val = (int)val;
+                break;
+            }
+            case 'd':
+                cfg->daemonize = 1;
+                break;
             case '?': // getopt reports invalid option or missing argument
                  // Error message is printed by getopt unless opterr is 0
                  fprintf(stderr, "Try '%s -h' for more information.\n", argv[0]);
@@ -125,6 +148,12 @@ void load_args(int argc, char **argv, Config *cfg) {
         exit(1);
     }
 
+    // Daemon mode only makes sense for server mode
+    if (cfg->daemonize && cfg->mode != 0) {
+        fprintf(stderr, "Error: Daemon mode (-d) can only be used with server mode (-s or default).\n");
+        exit(1);
+    }
+
     // Handle non-option arguments (if any)
     // for (int i = optind; i < argc; i++) {
     //     printf("Non-option argument: %s\n", argv[i]);
@@ -138,6 +167,8 @@ void print_config(const Config *cfg) {
     printf("  Bind Address: %s\n", cfg->bind_addr[0] != '\0' ? cfg->bind_addr : "All interfaces");
     printf("  Verbose: %s\n", cfg->verbose ? "Enabled" : "Disabled");
     printf("  Log Path: %s\n", cfg->log_path[0] != '\0' ? cfg->log_path : "stderr");
+    printf("  Timeout: %d seconds\n", cfg->timeout_val); // Print timeout
+    printf("  Daemonize: %s\n", cfg->daemonize ? "Enabled" : "Disabled"); // Print daemonize status
 }
 // Note: This function is for debugging purposes and can be removed in production
 // or replaced with a more sophisticated logging mechanism.

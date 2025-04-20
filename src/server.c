@@ -15,29 +15,26 @@
 #include <sys/epoll.h>  // Added for epoll
 #include <fcntl.h>      // Added for fcntl (non-blocking)
 #include <signal.h>     // Added for sig_atomic_t
-#include <stdio.h>      // For dprintf (writing help/errors to fd)
+#include <stdio.h>      // For snprintf (dprintf removed)
+#include <time.h>       // For time()
+
+#define WRITE_BUFFER_SIZE 512 // Buffer for formatting messages before write_all
 
 // Initial size and growth step for the dynamic buffer
-static const size_t INITIAL_BUFFER_SIZE = 128; // Initial size of the buffer
+static const size_t INITIAL_BUFFER_SIZE = 128; // Initial size of the buffer, size_t is from stdlib.h
 static const size_t GROWTH_INCREMENT = 128; // Growth step for the buffer
 static const size_t MAX_EVENTS = 64;       // Max events per epoll_wait call
 
 // --- Global flag to signal server halt ---
 static volatile sig_atomic_t halt_requested = 0;
 
-// Structure to hold state for each client
-typedef struct {
-    int fd;
-    char *buffer;
-    size_t buffer_size;     // Current number of bytes stored
-    size_t buffer_capacity; // Current allocated capacity
-} client_state;
-
 // --- Global Client Management (Dynamic Array) ---
 static client_state **clients = NULL; // Pointer to array of client_state pointers
 static int client_count = 0;          // Number of active clients
 static int client_capacity = 0;       // Allocated capacity of the clients array
 #define CLIENT_ARRAY_GROWTH 16        // How many slots to add when resizing
+// #define CLIENT_TIMEOUT_SECONDS (10 * 60) // Removed - now comes from cfg
+#define EPOLL_TIMEOUT_MS (30 * 1000)     // Check timeouts every 30 seconds
 
 // --- Helper Functions ---
 
@@ -93,6 +90,7 @@ static int add_client(int fd) {
     new_state->buffer = NULL;
     new_state->buffer_size = 0;
     new_state->buffer_capacity = 0;
+    new_state->last_activity = time(NULL); // Initialize last activity time
 
     // Add to array
     clients[client_count] = new_state;
@@ -144,8 +142,35 @@ static void remove_client(int fd, int epoll_fd) {
     }
 }
 
+// Helper function to write all data, handling partial writes and EINTR
+// (Assuming a similar write_all exists or is added, like in executor.c)
+static int write_all(int fd, const char *buf, size_t len) {
+    size_t total_written = 0;
+    while (total_written < len) {
+        ssize_t written = write(fd, buf + total_written, len - total_written);
+        if (written < 0) {
+            if (errno == EINTR) continue; // Interrupted system call, try again
+            // Log error, but don't use log_perror directly as it might interfere
+            // if stderr itself is redirected in complex ways. Write to original stderr.
+            char err_buf[256];
+            snprintf(err_buf, sizeof(err_buf), "ERROR: write failed in write_all (fd=%d): %s\n", fd, strerror(errno));
+            write(STDERR_FILENO, err_buf, strlen(err_buf)); // Use raw write to stderr
+            return -1; // Indicate failure
+        }
+        if (written == 0 && len > 0) {
+            // This shouldn't typically happen for blocking sockets/pipes unless fd is closed.
+            char err_buf[128];
+            snprintf(err_buf, sizeof(err_buf), "ERROR: write returned 0 unexpectedly (fd=%d)\n", fd);
+            write(STDERR_FILENO, err_buf, strlen(err_buf));
+            return -1; // Indicate failure
+        }
+        total_written += (size_t)written;
+    }
+    return 0; // Indicate success
+}
+
 // Handle data received from a client (No changes needed in this function itself)
-static void handle_client_read(int fd, int epoll_fd) {
+static void handle_client_read(int fd, int epoll_fd, const Config *cfg) {
     int index = find_client_index(fd);
     if (index == -1) {
         log_error("Read event for unknown client fd %d", fd);
@@ -155,6 +180,7 @@ static void handle_client_read(int fd, int epoll_fd) {
 
     client_state *client = clients[index];
     char read_buf[512]; // Temporary buffer for reading chunks
+    int data_read_this_call = 0; // Flag to check if any data was actually read
 
     log_debug("Handling read for fd %d", fd);
 
@@ -176,6 +202,9 @@ static void handle_client_read(int fd, int epoll_fd) {
             remove_client(fd, epoll_fd);
             return;
         }
+
+        // Mark that data was read
+        data_read_this_call = 1;
 
         // Append read data to client's dynamic buffer
         size_t required_capacity = client->buffer_size + count;
@@ -202,9 +231,18 @@ static void handle_client_read(int fd, int epoll_fd) {
         client->buffer_size += count;
     }
 
+    // Update last activity time *only if* data was actually read in this call
+    if (data_read_this_call) {
+        client->last_activity = time(NULL);
+        log_debug("Updated last_activity for fd %d", fd);
+    }
+
     // Process complete lines from the buffer
     char *line_start = client->buffer;
     char *newline_pos;
+    char msg_buf[WRITE_BUFFER_SIZE]; // Buffer for messages
+    int n; // For snprintf return value
+
     while ((newline_pos = memchr(line_start, '\n', client->buffer_size - (line_start - client->buffer))) != NULL) {
         // size_t line_len = newline_pos - line_start;
 
@@ -219,7 +257,8 @@ static void handle_client_read(int fd, int epoll_fd) {
         if (tokens == NULL) {
             log_error("Tokenizer failed for input from fd %d", fd);
             // Optionally send an error message back to the client
-            dprintf(fd, "Error: Tokenization failed.\n");
+            n = snprintf(msg_buf, sizeof(msg_buf), "Error: Tokenization failed.\n");
+            if (n > 0) write_all(fd, msg_buf, n);
             // Continue to next line or handle error further
         } else {
             // 2. Parse
@@ -228,11 +267,13 @@ static void handle_client_read(int fd, int epoll_fd) {
                 log_error("Parser failed for input from fd %d", fd);
                 // Parser already prints syntax errors to stderr
                 // Optionally send a generic error message back to the client
-                dprintf(fd, "Error: Command parsing failed (syntax error?).\n");
+                n = snprintf(msg_buf, sizeof(msg_buf), "Error: Command parsing failed (syntax error?).\n");
+                if (n > 0) write_all(fd, msg_buf, n);
             } else {
                 // 3. Execute
                 log_debug("Executing command sequence for fd %d", fd);
-                int exec_result = execute_command_sequence(cmd_sequence, fd);
+                // Pass cfg, clients, and client_count to the executor
+                int exec_result = execute_command_sequence(cmd_sequence, fd, cfg, clients, client_count);
                 log_debug("Execution finished for fd %d with result %d", fd, exec_result);
         
                 // Handle execution results
@@ -250,7 +291,8 @@ static void handle_client_read(int fd, int epoll_fd) {
                     // Example: Set a global flag `static volatile sig_atomic_t halt_requested = 0;`
                     //          and check it in the server_run loop.
                     halt_requested = 1; // Set the global flag to signal shutdown
-                    dprintf(fd, "Server halt initiated.\n"); // Inform client
+                    n = snprintf(msg_buf, sizeof(msg_buf), "Server halt initiated.\n"); // Inform client
+                    if (n > 0) write_all(fd, msg_buf, n);
                     // The main loop will detect the flag and break
                 } else if (exec_result == EXEC_ERROR) {        
                     log_error("Critical execution error for fd %d.", fd);
@@ -274,16 +316,15 @@ static void handle_client_read(int fd, int epoll_fd) {
         // --- Send prompt after processing command ---
         const char *prompt = generate_prompt();
         ssize_t prompt_len = strlen(prompt);
-        if (write(fd, prompt, prompt_len) < 0) {
-             if (errno != EPIPE && errno != EAGAIN && errno != EWOULDBLOCK) {
-                log_perror("write prompt failed");
-             } else if (errno == EPIPE) {
+        // Use write_all for prompt as well for consistency
+        if (write_all(fd, prompt, prompt_len) < 0) {
+             // write_all logs errors internally, check errno if needed
+             if (errno == EPIPE) {
                  log_info("Client fd %d disconnected (Broken Pipe on prompt write)", fd);
                  remove_client(fd, epoll_fd);
                  return; // Client gone
              }
-             // If EAGAIN/EWOULDBLOCK, prompt might not be sent immediately.
-             // A full implementation would buffer this output.
+             // If EAGAIN/EWOULDBLOCK (less likely with write_all), or other errors logged by write_all
         }
         // --- End prompt sending ---
 
@@ -360,11 +401,12 @@ int socket_setup(const Config *cfg) {
     return listen_fd;
 }
 
-void server_run(const Config *cfg) {
+void server_run(const Config *cfg) { // Pass cfg as const pointer
     // Ensure globals are initialized (should be automatic for static globals)
     clients = NULL;
     client_count = 0;
     client_capacity = 0;
+    halt_requested = 0; // Ensure halt flag is reset at start
 
     int listen_fd = socket_setup(cfg);
     if (listen_fd < 0) return;
@@ -393,7 +435,8 @@ void server_run(const Config *cfg) {
     // Main Event Loop
     // for (;;) { // Original loop
     while (!halt_requested) { // Loop until halt is requested
-        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1); // Wait indefinitely
+        // Use a timeout for epoll_wait to allow periodic checks
+        int epoll_result = epoll_wait(epoll_fd, events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
 
         // Check halt flag *immediately* after epoll_wait returns,
         // especially if wait could be interrupted by signals in the future.
@@ -402,7 +445,7 @@ void server_run(const Config *cfg) {
             break;
         }
 
-        if (n == -1) {
+        if (epoll_result == -1) {
             if (errno == EINTR) {
                 continue; // Interrupted by signal, safe to continue
             }
@@ -410,96 +453,128 @@ void server_run(const Config *cfg) {
             break; // Exit loop on other errors
         }
 
-        log_debug("epoll_wait returned %d events", n);
+        // Process epoll events if any
+        if (epoll_result > 0) {
+            log_debug("epoll_wait returned %d events", epoll_result);
+            for (int i = 0; i < epoll_result; i++) {
+                uint32_t current_events = events[i].events;
+                int current_fd = events[i].data.fd;
 
-        for (int i = 0; i < n; i++) {
-            uint32_t current_events = events[i].events;
-            int current_fd = events[i].data.fd;
+                if ((current_events & EPOLLERR) || (current_events & EPOLLHUP)) {
+                    // Error or hang up occurred on this fd.
+                    log_error("epoll error/hangup on fd %d", current_fd);
+                    // Check if it's the listening socket (unlikely, but possible)
+                    if (current_fd != listen_fd) {
+                        remove_client(current_fd, epoll_fd); // Close and remove client
+                    } else {
+                        log_error("Error on listening socket %d! Shutting down?", current_fd);
+                        // Handle listening socket error (e.g., break loop)
+                        goto cleanup; // Use goto for simplicity in this case
+                    }
+                } else if (current_fd == listen_fd) {
+                    // New incoming connection(s)
+                    log_debug("Accepting new connections on listen_fd %d", listen_fd);
+                    while (1) {
+                        struct sockaddr_in cli_addr;
+                        socklen_t cli_len = sizeof(cli_addr);
+                        int client_fd = accept(listen_fd, (struct sockaddr*)&cli_addr, &cli_len);
 
-            if ((current_events & EPOLLERR) || (current_events & EPOLLHUP)) {
-                // Error or hang up occurred on this fd.
-                log_error("epoll error/hangup on fd %d", current_fd);
-                // Check if it's the listening socket (unlikely, but possible)
-                if (current_fd != listen_fd) {
-                    remove_client(current_fd, epoll_fd); // Close and remove client
-                } else {
-                    log_error("Error on listening socket %d! Shutting down?", current_fd);
-                    // Handle listening socket error (e.g., break loop)
-                    goto cleanup; // Use goto for simplicity in this case
-                }
-            } else if (current_fd == listen_fd) {
-                // New incoming connection(s)
-                log_debug("Accepting new connections on listen_fd %d", listen_fd);
-                while (1) {
-                    struct sockaddr_in cli_addr;
-                    socklen_t cli_len = sizeof(cli_addr);
-                    int client_fd = accept(listen_fd, (struct sockaddr*)&cli_addr, &cli_len);
+                        if (client_fd == -1) {
+                            if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+                                // We have processed all incoming connections.
+                                log_debug("Finished accepting connections (EAGAIN/EWOULDBLOCK)");
+                                break;
+                            } else {
+                                log_perror("accept failed");
+                                break; // Error accepting
+                            }
+                        }
 
-                    if (client_fd == -1) {
-                        if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
-                            // We have processed all incoming connections.
-                            log_debug("Finished accepting connections (EAGAIN/EWOULDBLOCK)");
-                            break;
+                        char client_ip[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &cli_addr.sin_addr, client_ip, sizeof(client_ip));
+                        log_info("Client connected from %s:%d (fd: %d)", client_ip, ntohs(cli_addr.sin_port), client_fd);
+
+                        if (make_socket_non_blocking(client_fd) == -1) {
+                            close(client_fd);
+                            continue; // Failed to make non-blocking
+                        }
+
+                        int client_index = add_client(client_fd); // Use dynamic add_client
+                        if (client_index == -1) {
+                            log_error("Failed to add client state for fd %d (capacity %d)", client_fd, client_capacity);
+                            close(client_fd); // Close socket if we can't manage state
+                            continue;
+                        }
+
+                        event.data.fd = client_fd;
+                        // Monitor for input, edge-triggered, and remote close/half-close
+                        event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+                        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) == -1) {
+                            log_perror("epoll_ctl(ADD client_fd) failed");
+                            remove_client(client_fd, epoll_fd); // Clean up if add fails
                         } else {
-                            log_perror("accept failed");
-                            break; // Error accepting
+                             log_debug("Added client fd %d to epoll", client_fd);
+                             // --- Send initial prompt ---
+                             const char *prompt = generate_prompt();
+                             ssize_t prompt_len = strlen(prompt);
+                             if (write_all(client_fd, prompt, prompt_len) < 0) {
+                                 if (errno != EPIPE && errno != EAGAIN && errno != EWOULDBLOCK) {
+                                    log_perror("initial prompt write failed");
+                                    // Consider removing client if initial write fails badly?
+                                 } else if (errno == EPIPE) {
+                                     log_info("Client fd %d disconnected immediately (Broken Pipe on initial prompt)", client_fd);
+                                     remove_client(client_fd, epoll_fd); // Clean up immediately
+                                 }
+                                 // If EAGAIN/EWOULDBLOCK, prompt might not be sent immediately.
+                             }
+                             // --- End initial prompt sending ---
                         }
                     }
-
-                    char client_ip[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &cli_addr.sin_addr, client_ip, sizeof(client_ip));
-                    log_info("Client connected from %s:%d (fd: %d)", client_ip, ntohs(cli_addr.sin_port), client_fd);
-
-                    if (make_socket_non_blocking(client_fd) == -1) {
-                        close(client_fd);
-                        continue; // Failed to make non-blocking
+                } else {
+                    // Data available from existing client or client disconnected
+                     if (current_events & EPOLLRDHUP) {
+                        // Client closed connection or shutdown writing half (treat as disconnect)
+                        log_info("Client fd %d disconnected (EPOLLRDHUP)", current_fd);
+                        remove_client(current_fd, epoll_fd);
+                    } else if (current_events & EPOLLIN) {
+                        // Data is available to read
+                        handle_client_read(current_fd, epoll_fd, cfg);
                     }
+                    // Note: We are not explicitly handling EPOLLOUT here for simplicity.
+                    // Writes are currently attempted directly within handle_client_read.
+                }
+            } // End loop through events
+        } else {
+            // epoll_wait timed out (n == 0)
+            log_debug("epoll_wait timed out, checking for client timeouts.");
+        }
 
-                    int client_index = add_client(client_fd); // Use dynamic add_client
-                    if (client_index == -1) {
-                        log_error("Failed to add client state for fd %d (capacity %d)", client_fd, client_capacity);
-                        close(client_fd); // Close socket if we can't manage state
-                        continue;
-                    }
+        // --- Check for Client Timeouts (runs after processing events or timeout) ---
+        time_t current_time = time(NULL);  // time(NULL) gets the current time
+        char msg_buf[WRITE_BUFFER_SIZE]; // Buffer for timeout message
+        int msg_len; // Renamed from n
 
-                    event.data.fd = client_fd;
-                    // Monitor for input, edge-triggered, and remote close/half-close
-                    event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) == -1) {
-                        log_perror("epoll_ctl(ADD client_fd) failed");
-                        remove_client(client_fd, epoll_fd); // Clean up if add fails
-                    } else {
-                         log_debug("Added client fd %d to epoll", client_fd);
-                         // --- Send initial prompt ---
-                         const char *prompt = generate_prompt();
-                         ssize_t prompt_len = strlen(prompt);
-                         if (write(client_fd, prompt, prompt_len) < 0) {
-                             if (errno != EPIPE && errno != EAGAIN && errno != EWOULDBLOCK) {
-                                log_perror("initial prompt write failed");
-                                // Consider removing client if initial write fails badly?
-                             } else if (errno == EPIPE) {
-                                 log_info("Client fd %d disconnected immediately (Broken Pipe on initial prompt)", client_fd);
-                                 remove_client(client_fd, epoll_fd); // Clean up immediately
-                             }
-                             // If EAGAIN/EWOULDBLOCK, prompt might not be sent immediately.
-                         }
-                         // --- End initial prompt sending ---
+        // Iterate backwards to allow safe removal while iterating
+        for (int i = client_count - 1; i >= 0; --i) {
+            if (clients[i]) { // Check if client exists at this index
+                // Use cfg->timeout_val for the check
+                if (cfg->timeout_val > 0) { // Only check if timeout is enabled (> 0)
+                    double elapsed = difftime(current_time, clients[i]->last_activity);
+                    if (elapsed >= cfg->timeout_val) {
+                        log_info("Client fd %d timed out after %.0f seconds of inactivity (limit: %d). Disconnecting.", clients[i]->fd, elapsed, cfg->timeout_val);
+                        // Inform client (best effort) using write_all
+                        msg_len = snprintf(msg_buf, sizeof(msg_buf), "Connection timed out due to inactivity.\n");
+                        if (msg_len > 0) {
+                            // Ignore write_all error here, as client is likely gone anyway
+                            write_all(clients[i]->fd, msg_buf, msg_len);
+                        }
+                        remove_client(clients[i]->fd, epoll_fd); // remove_client handles epoll removal and closing fd
                     }
                 }
-            } else {
-                // Data available from existing client or client disconnected
-                 if (current_events & EPOLLRDHUP) {
-                    // Client closed connection or shutdown writing half (treat as disconnect)
-                    log_info("Client fd %d disconnected (EPOLLRDHUP)", current_fd);
-                    remove_client(current_fd, epoll_fd);
-                } else if (current_events & EPOLLIN) {
-                    // Data is available to read
-                    handle_client_read(current_fd, epoll_fd);
-                }
-                // Note: We are not explicitly handling EPOLLOUT here for simplicity.
-                // Writes are currently attempted directly within handle_client_read.
             }
-        } // End loop through events
+        }
+        // --- End Timeout Check ---
+
     } // End main event loop
 
 cleanup: // Label for cleanup jump
