@@ -62,15 +62,10 @@ int daemonize_process() {
     }
      // Close stderr *last* so we can still log errors from closing stdin/stdout
     if (close(STDERR_FILENO) < 0) {
-        // Cannot log this error easily as stderr is now closed (or failed to close)
-        // We could try reopening stderr to /dev/null first, then closing original.
-        // For simplicity, just attempt close.
+        // Cannot log this error easily as stderr is now closed
     }
 
     // Redirect standard file descriptors to /dev/null
-    // Note: Logger might be using stderr, redirecting it might affect logging
-    // unless the logger was initialized *after* daemonization or explicitly
-    // handles its own file descriptor. Assuming logger uses its own fd if configured.
     log_debug("daemonize: Redirecting stdio to /dev/null.");
     int fd0 = open("/dev/null", O_RDWR); // stdin
     int fd1 = open("/dev/null", O_RDWR); // stdout
