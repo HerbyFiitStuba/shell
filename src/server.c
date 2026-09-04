@@ -329,9 +329,21 @@ static void handle_client_read(int fd, int epoll_fd, const Config *cfg) {
                 log_error("Internal error: Invalid index '%s' received from executor for abort command from fd %d.", cmd_sequence->argv[1], fd);
             }
         } else if (exec_result == EXEC_ERROR) {
-            log_error("Execution error occurred for fd %d.", fd);
+            // This now indicates a critical error during pipeline setup (fork, pipe etc.)
+            // or a command terminated by signal. Simple command failures (exit != 0)
+            // should result in EXEC_OK from execute_command_sequence.
+            log_error("Critical execution error occurred for fd %d (e.g., fork/pipe failure, signal).", fd);
+            // Optionally inform the client, though stderr might have already received info
+            msg_len = snprintf(msg_buf, sizeof(msg_buf), "Error: Critical internal error during command execution.\n");
+            if (msg_len > 0) write_all(fd, msg_buf, msg_len);
+            // Continue processing other lines for this client unless the error was fatal for the connection
+        } else {
+             // Includes EXEC_OK and potentially other values if execute_command_sequence is changed later.
+             // EXEC_OK means the sequence completed structurally, even if individual commands failed.
+             log_debug("Command sequence processed for fd %d with result code %d (EXEC_OK means sequence structure ok).", fd, exec_result);
+             // Continue normally
         }
-        // continue normally
+
 
         // Free structures for the processed command/line
         free_command_sequence(cmd_sequence);
